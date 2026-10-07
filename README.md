@@ -21,7 +21,7 @@
 git clone https://github.com/vow132/infinite-canvas.git
 cd infinite-canvas
 cp .env.example .env
-docker compose up -d
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
 启动后访问 <http://localhost:3000>，默认管理员账号 `admin`，密码为 `.env` 中的 `ADMIN_PASSWORD`。
@@ -35,6 +35,14 @@ cd web && bun install && bun run dev   # 启动前端
 ```
 
 首次使用建议：打开右上角配置弹窗，填入自己的 `Base URL`、`API Key` 和模型名；如使用后台渠道模式，再到管理后台补充系统模型与渠道配置。
+
+## CI/CD
+
+GitHub Actions 的 CI 检查 Go 后端、Comfy Bridge 和前端构建。推送 `main` 且 CI 成功后，CD 才通过 SSH 部署对应提交到现有服务：<https://ac.91i.asia>。
+
+服务器部署源码位于 `~/infinite-canvas-deploy`，复用 `~/pi-web-deploy/docker-compose.yml` 的 `infinite-canvas` 服务、环境配置和数据卷，不重启 Caddy 或其他服务。部署后检查前后端及本机反代，失败时尝试恢复上一版镜像。
+
+SSH 连接使用 GitHub Secrets：`SSH_HOST`、`SSH_PORT`、`SSH_USERNAME`、`SSH_PASSWORD`、`SSH_FINGERPRINT`。服务器密码不写入仓库；如需重新部署，可在 Actions 页面重新运行对应提交的 CI。
 
 ## 文档
 

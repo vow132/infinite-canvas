@@ -1,32 +1,72 @@
 name: Deploy
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: deploy
+  group: production-deploy
   cancel-in-progress: false
 
 jobs:
   deploy:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: production
+      url: https://ac.91i.asia
     steps:
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1
+      - name: Deploy tested commit to existing service
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           password: ${{ secrets.SSH_PASSWORD }}
           port: ${{ secrets.SSH_PORT }}
-          command_timeout: 30m
+          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
+          envs: DEPLOY_SHA,REPO_URL
+          command_timeout: 40m
           script: |
-            if [ ! -d ~/infinite-canvas/.git ]; then
-              git clone ${{ github.server_url }}/${{ github.repository }}.git ~/infinite-canvas
+            set -eu
+            source_dir="$HOME/infinite-canvas-deploy"
+            if [ ! -d "$source_dir" ]; then
+              git clone "$REPO_URL" "$source_dir"
             fi
-            cd ~/infinite-canvas
-            git pull --ff-only
-            [ -f .env ] || cp .env.example .env
-            docker compose -f docker-compose.local.yml up -d --build
-            docker image prune -f
+            cd "$source_dir"
+            [ "$(git remote get-url origin)" = "$REPO_URL" ]
+            [ -z "$(git status --porcelain)" ] || { echo 'Deploy checkout has local changes; stopping.'; exit 1; }
+            git fetch origin main
+            [ "$(git rev-parse origin/main)" = "$DEPLOY_SHA" ] || { echo 'A newer main commit exists; skipping this deployment.'; exit 0; }
+            git checkout --detach "$DEPLOY_SHA"
+
+            candidate="infinite-canvas:cd-$DEPLOY_SHA"
+            docker build --label "org.opencontainers.image.revision=$DEPLOY_SHA" -t "$candidate" .
+            cd "$HOME/pi-web-deploy"
+            previous_id=$(docker inspect --format '{{.Image}}' infinite-canvas)
+            image=$(docker inspect --format '{{.Config.Image}}' infinite-canvas)
+            [ "$image" = 'infinite-canvas:tigerowo-patched' ] || { echo 'Unexpected running image; stopping.'; exit 1; }
+            docker tag "$previous_id" infinite-canvas:cd-previous
+            docker tag "$candidate" "$image"
+            if docker compose up -d --no-deps --no-build --force-recreate infinite-canvas; then
+              for attempt in $(seq 1 30); do
+                if docker exec infinite-canvas node -e 'Promise.all([fetch("http://127.0.0.1:8080/api/health", {signal: AbortSignal.timeout(10000)}).then(async r => { if (!r.ok || await r.text() !== "ok") throw Error("API unhealthy"); }), fetch("http://127.0.0.1:3000/", {signal: AbortSignal.timeout(10000)}).then(r => { if (!r.ok) throw Error("Frontend unhealthy"); })]).catch(() => process.exit(1))' &&
+                   curl --fail --silent --show-error --max-time 10 --insecure --resolve ac.91i.asia:8443:127.0.0.1 https://ac.91i.asia:8443/ -o /dev/null; then
+                  echo "Deployed $DEPLOY_SHA to https://ac.91i.asia"
+                  exit 0
+                fi
+                sleep 5
+              done
+            fi
+            echo 'Deployment failed; restoring previous image.'
+            docker tag infinite-canvas:cd-previous "$image"
+            docker compose up -d --no-deps --no-build --force-recreate infinite-canvas
+            exit 1
